@@ -47960,6 +47960,22 @@ const {
   CI
 } = process.env;
 const logLevel = CI ? src/* LogLevel.INFO */["in"].INFO : src/* LogLevel.DEBUG */["in"].DEBUG;
+async function getExistingPages(items) {
+  const notion = new src/* Client */.KU({
+    auth: NOTION_API_TOKEN,
+    logLevel
+  });
+  const response = await notion.databases.query({
+    database_id: NOTION_READER_DATABASE_ID,
+    or: items.map(item => ({
+      property: 'Link',
+      text: {
+        equals: item.link
+      }
+    }))
+  });
+  return response.results;
+}
 async function getFeedUrlsFromNotion() {
   const notion = new src/* Client */.KU({
     auth: NOTION_API_TOKEN,
@@ -47978,7 +47994,8 @@ async function getFeedUrlsFromNotion() {
   });
   const feeds = response.results.map(item => ({
     title: item.properties.Title.title[0].plain_text,
-    feedUrl: item.properties.Link.url
+    feedUrl: item.properties.Link.url,
+    page: item
   }));
   return feeds;
 }
@@ -47986,28 +48003,68 @@ async function addFeedItemToNotion(notionItem) {
   const {
     title,
     link,
-    content
+    content,
+    feed,
+    pubDate,
+    creator
   } = notionItem;
   const notion = new src/* Client */.KU({
     auth: NOTION_API_TOKEN,
     logLevel
   });
+  let publishedData = {};
+
+  if (pubDate !== undefined) {
+    publishedData = {
+      Published: {
+        date: {
+          start: new Date(pubDate).toISOString()
+        }
+      }
+    };
+  }
+
+  let creatorData = {};
+
+  if (creator !== undefined) {
+    creatorData = {
+      Creator: {
+        rich_text: [{
+          text: {
+            content: creator
+          }
+        }]
+      }
+    };
+  }
+
+  const propertiesData = {
+    Title: {
+      title: [{
+        text: {
+          content: title
+        }
+      }]
+    },
+    Link: {
+      url: link
+    },
+    Tags: {
+      multi_select: feed.page.properties.Tags.multi_select.map(item => ({
+        name: item.name
+      }))
+    },
+    Feed: {
+      relation: [{
+        id: feed.page.id
+      }]
+    }
+  };
   await notion.pages.create({
     parent: {
       database_id: NOTION_READER_DATABASE_ID
     },
-    properties: {
-      Title: {
-        title: [{
-          text: {
-            content: title
-          }
-        }]
-      },
-      Link: {
-        url: link
-      }
-    },
+    properties: Object.assign({}, propertiesData, publishedData, creatorData),
     children: content
   });
 }
@@ -48053,17 +48110,20 @@ async function deleteOldUnreadItemsFromNotion() {
 
 
 
-async function getNewFeedItemsFrom(feedUrl) {
+async function getNewFeedItemsFrom(feed) {
   const parser = new (rss_parser_default())();
-  const rss = await parser.parseURL(feedUrl);
+  const rss = await parser.parseURL(feed.feedUrl);
   const todaysDate = new Date().getTime() / 1000;
-  return rss.items.filter(item => {
+  const items = rss.items.filter(item => {
     const blogPublishedDate = new Date(item.pubDate).getTime() / 1000;
     const {
       diffInDays
     } = timeDifference(todaysDate, blogPublishedDate);
     return diffInDays === 0;
   });
+  return items.map(item => Object.assign({}, item, {
+    feed
+  }));
 }
 
 async function getNewFeedItems() {
@@ -48071,10 +48131,7 @@ async function getNewFeedItems() {
   const feeds = await getFeedUrlsFromNotion();
 
   for (let i = 0; i < feeds.length; i++) {
-    const {
-      feedUrl
-    } = feeds[i];
-    const feedItems = await getNewFeedItemsFrom(feedUrl);
+    const feedItems = await getNewFeedItemsFrom(feeds[i]);
     allNewFeedItems = [...allNewFeedItems, ...feedItems];
   } // sort feed items by published date
 
@@ -49045,7 +49102,7 @@ function jsonToNotionBlocks(markdownContent) {
 }
 
 function htmlToNotionBlocks(htmlContent) {
-  const imageUrlRegex = /(http(s?):)([/|.|\w|\s|-])*\.(?:jpg|jpeg|webp|gif|png)/gi;
+  const imageUrlRegex = /(http(s?):).*\.(?:jpg|jpeg|webp|gif|png)/gi;
   const markdownContent = htmlToMarkdown(htmlContent);
   const notionBlocks = jsonToNotionBlocks(markdownContent);
   const notionBlocksWithImages = notionBlocks.map(block => {
@@ -49074,15 +49131,24 @@ function htmlToNotionBlocks(htmlContent) {
 
 async function index() {
   const feedItems = await getNewFeedItems();
+  const existingPages = await getExistingPages(feedItems);
 
   for (let i = 0; i < feedItems.length; i++) {
     const item = feedItems[i];
+    const existingEntries = existingPages.find(page => page.properties.Link.url === item.link);
+    const isNewEntry = existingEntries === undefined;
     const notionItem = {
       title: item.title,
       link: item.link,
-      content: htmlToNotionBlocks(item.content)
+      content: htmlToNotionBlocks(item.content),
+      feed: item.feed,
+      pubDate: item.pubDate,
+      creator: item['dc:creator']
     };
-    await addFeedItemToNotion(notionItem);
+
+    if (isNewEntry) {
+      await addFeedItemToNotion(notionItem);
+    }
   }
 
   await deleteOldUnreadItemsFromNotion();
